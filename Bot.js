@@ -1,7 +1,6 @@
 const { Alchemy, Network } = require("alchemy-sdk");
 const { Web3 } = require('web3');
 require("dotenv").config();
-const { default: PQueue } = require('p-queue');
 
 const {
     DynamoDBClient,
@@ -57,42 +56,8 @@ const web3Http = new Web3(providerAlchemyHttp);
 const cleanPrivateKey = '0x' + PRIVATE_KEY.trim();
 const account = web3Http.eth.accounts.privateKeyToAccount(cleanPrivateKey);
 
-const queue = new PQueue({ concurrency: 5 });
-let currentNonce;
-let isResyncing = false;
-let deferredPings = [];
-
-async function handleNonceResync() {
-    if (isResyncing) return;
-    isResyncing = true;
-    
-    queue.pause();
-    
-    const hashesToRequeue = Array.from(pendingPingHashes);
-
-    queue.clear();
-    
-    try {
-        const newNonce = await web3Http.eth.getTransactionCount(account.address, "pending");
-        currentNonce = newNonce;
-    } catch(e) {
-        return; 
-    }
-
-    pendingPingHashes.clear();
-    for (const hash of hashesToRequeue) {
-        await handlePingEvent({ transactionHash: hash });
-    }
-
-    const pingsToProcessNow = [...deferredPings];
-    deferredPings = [];
-    for (const hash of pingsToProcessNow) {
-        await handlePingEvent({ transactionHash: hash });
-    }
-    
-    isResyncing = false;
-    queue.start();
-}
+let txQueue = [];
+let isProcessingQueue = false;
 
 async function ensureTableExists(tableName, keySchema, attributeDefinitions) {
     try {
@@ -109,7 +74,6 @@ async function ensureTableExists(tableName, keySchema, attributeDefinitions) {
         }
     }
 }
-
 async function markPingAsPending(pingTxHash) {
     const params = {
         TableName: DYNAMODB_STATUS_TABLE,
@@ -119,7 +83,6 @@ async function markPingAsPending(pingTxHash) {
     };
     await docClient.send(new UpdateCommand(params));
 }
-
 async function markPingAsSuccess(pingTxHash, receipt) {
     const params = {
         TableName: DYNAMODB_STATUS_TABLE,
@@ -135,7 +98,6 @@ async function markPingAsSuccess(pingTxHash, receipt) {
     };
     await docClient.send(new UpdateCommand(params));
 }
-
 async function markPingAsFailed(pingTxHash) {
     const params = {
         TableName: DYNAMODB_STATUS_TABLE,
@@ -145,7 +107,6 @@ async function markPingAsFailed(pingTxHash) {
     };
     await docClient.send(new UpdateCommand(params));
 }
-
 async function updateLastProcessedBlockInDb(blockNumber) {
     const params = {
         TableName: DYNAMODB_STATUS_TABLE,
@@ -155,7 +116,6 @@ async function updateLastProcessedBlockInDb(blockNumber) {
     };
     await docClient.send(new UpdateCommand(params));
 }
-
 async function recordFailedTransaction(txHash, reason) {
     const params = {
         TableName: DYNAMODB_FAILED_TX_TABLE,
@@ -169,35 +129,41 @@ async function recordFailedTransaction(txHash, reason) {
 }
 
 async function handlePingEvent({ transactionHash }) {
-    if (isResyncing) {
-        deferredPings.push(transactionHash);
-        return;
-    }
-
     if (!transactionHash || processedTxs.has(transactionHash) || pendingPingHashes.has(transactionHash)) {
         return;
     }
 
-    pendingPingHashes.add(transactionHash);
+    if (!txQueue.includes(transactionHash)) {
+        txQueue.push(transactionHash);
+    }
     
-    const nonceForTx = currentNonce;
-    currentNonce++;
-    
-    queue.add(() => processSingleTransaction(transactionHash, nonceForTx));
+    processTxQueue();
 }
 
-async function processSingleTransaction(pingTxHash, nonce) {
-    try {
-        await markPingAsPending(pingTxHash);
-        const contract = new web3Http.eth.Contract(contractABI, CONTRACT_ADDRESS);
-        const tx = contract.methods.pong(pingTxHash);
+async function processTxQueue() {
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
 
+    const contract = new web3Http.eth.Contract(contractABI, CONTRACT_ADDRESS);
+
+    while (txQueue.length > 0) {
+        const pingTxHash = txQueue.shift();
+        if (processedTxs.has(pingTxHash)) { continue; }
+
+        pendingPingHashes.add(pingTxHash);
+        await markPingAsPending(pingTxHash);
+
+        let success = false;
         let finalError = "Max retries reached.";
 
         for (let retries = 0; retries < MAX_RETRIES; retries++) {
             try {
+                let nonce = await web3Http.eth.getTransactionCount(account.address, "pending");
+                
+                const tx = contract.methods.pong(pingTxHash);
                 const gas = await tx.estimateGas({ from: account.address });
                 const data = tx.encodeABI();
+                
                 const pendingBlock = await web3Http.eth.getBlock("pending");
                 const priorityFee = BigInt(1.5 * 1e9) + (BigInt(retries) * BigInt(1 * 1e9));
                 const baseFee = pendingBlock.baseFeePerGas ? BigInt(pendingBlock.baseFeePerGas) : BigInt(20 * 1e9);
@@ -209,30 +175,29 @@ async function processSingleTransaction(pingTxHash, nonce) {
                 const receipt = await web3Http.eth.sendSignedTransaction(signedTx.rawTransaction);
 
                 processedTxs.add(pingTxHash);
+                pendingPingHashes.delete(pingTxHash);
                 lastProcessedBlock = Number(receipt.blockNumber);
                 await markPingAsSuccess(pingTxHash, receipt);
-                return;
+                
+                success = true;
+                break;
             } catch (error) {
-               const errMsg = error.message || error.toString();
+                const errMsg = error.message || error.toString();
                 finalError = errMsg;
-
-                if (errMsg.includes("nonce too low") || errMsg.includes("replacement transaction underpriced")) {
-                     await handleNonceResync();
-                     return;
-                }
-
                 if (retries < MAX_RETRIES - 1) {
                     await new Promise(r => setTimeout(r, 2000 * (retries + 1)));
                 }
             }
         }
-        await recordFailedTransaction(pingTxHash, finalError);
-        await markPingAsFailed(pingTxHash);
 
-    } catch (e) {
-        await recordFailedTransaction(pingTxHash, "Unhandled exception in processor.");
-        await markPingAsFailed(pingTxHash);
+        if (!success) {
+            await recordFailedTransaction(pingTxHash, finalError);
+            pendingPingHashes.delete(pingTxHash);
+            await markPingAsFailed(pingTxHash);
+        }
     }
+
+    isProcessingQueue = false;
 }
 
 async function catchUpMissedEvents(startFromBlock) {
@@ -242,14 +207,15 @@ async function catchUpMissedEvents(startFromBlock) {
     if (startFromBlock >= latestBlock) {
       return;
     }
-
     const CHUNK_SIZE = 499;
     for (let fromBlock = startFromBlock + 1; fromBlock <= latestBlock; fromBlock += CHUNK_SIZE) {
       const toBlock = Math.min(fromBlock + CHUNK_SIZE - 1, latestBlock);
       try {
         const events = await contract.getPastEvents("Ping", { fromBlock, toBlock });
         for (const event of events) {
-            await handlePingEvent(event);
+            if (!txQueue.includes(event.transactionHash)) {
+                txQueue.push(event.transactionHash);
+            }
         }
         await updateLastProcessedBlockInDb(toBlock);
       } catch (error) {
@@ -286,16 +252,20 @@ async function catchUpMissedEvents(startFromBlock) {
         await docClient.send(new PutCommand({ TableName: DYNAMODB_STATUS_TABLE, Item: initialItem }));
     }
 
-    currentNonce = await web3Http.eth.getTransactionCount(account.address, "pending");
-
     if (pendingPingHashes.size > 0) {
         for (const hash of pendingPingHashes) {
-            await handlePingEvent({ transactionHash: hash });
+            if (!txQueue.includes(hash)) {
+                txQueue.push(hash);
+            }
         }
     }
 
     await catchUpMissedEvents(lastProcessedBlock);
 
+    if (txQueue.length > 0) {
+        processTxQueue();
+    }
+    
     alchemy.ws.on({ address: CONTRACT_ADDRESS, topics: [pingEventSig] }, (log) => {
       handlePingEvent({ transactionHash: log.transactionHash });
     });
