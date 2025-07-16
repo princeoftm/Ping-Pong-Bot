@@ -79,7 +79,7 @@ AWS_SECRET_ACCESS_KEY="YOUR_AWS_SECRET_KEY"
 
 ## ▶️ 2. Running the Bot
 
-Once the setup is complete, you can start the bot with the following command (assuming your file is named `bot.js`):
+Once the setup is complete, you can start the bot with the following command
 
 ```bash
 node bot.js
